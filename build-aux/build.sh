@@ -16,5 +16,8 @@ ln_overwrite_all /usr/lib/sdk/openjdk21 third_party/jdk/current
 # Chromium's Rust output paths and sysroots for sccache.
 export RUSTC_WRAPPER=$PWD/rustc-cache.py
 
+# hdr-max-cll-157: compile the code the HDR backport touches first, so a backport
+# error shows up in minutes instead of after the whole browser build.
+ninja -C out/Release -j$FLATPAK_BUILDER_N_JOBS components/viz/service:service ui/ozone/platform/wayland:wayland
 ninja -C out/Release -j$FLATPAK_BUILDER_N_JOBS chrome chrome_crashpad_handler
 /app/bin/sccache --show-stats

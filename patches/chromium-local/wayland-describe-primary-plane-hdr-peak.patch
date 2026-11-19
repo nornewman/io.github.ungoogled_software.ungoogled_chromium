@@ -1,0 +1,1477 @@
+From d66f5d19bb37835300a9cb699a8b4ca0137951f0 Mon Sep 17 00:00:00 2001
+From: Thomas Anderson <thomasanderson@chromium.org>
+Date: Mon, 26 Oct 2026 20:50:39 -0700
+Subject: [PATCH] [Wayland] Describe the primary plane's real HDR peak to the
+ compositor
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Previously, when Chromium output HDR to a Wayland compositor using
+wp_color_management_v1, the primary plane had no HDR metadata.
+WaylandWpColorManager then sent:
+  * set_luminances(0, 1000, ref): the 1000 is a hardcoded fallback that
+    is ignored for PQ.
+  * set_max_cll(ref) / set_max_fall(ref): a workaround from
+    crrev.com/c/7113272.
+
+How compositors use these values:
+  * KWin ignores the max of set_luminances for PQ and takes the content
+    peak from max_cll, falling back to the mastering max luminance, and
+    then to 10000 nits. It tone maps the surface if that peak exceeds
+    the display peak. Without max_cll, a PQ surface was treated as
+    10000 nits and tone mapped heavily, which made SDR content dark on
+    KWin 6.5. That is the issue the workaround hid.
+  * With max_cll = ref, KWin skips tone mapping and clips at the
+    content peak. Since KWin 6.8 (KWin commit cc7635e4fe, "always clip
+    to source range") the shader path clips at the source peak, so all
+    HDR highlights in composited video were clipped to SDR white.
+  * mutter ignores max_cll/max_fall and doesn't advertise mastering
+    metadata, but it raises a protocol error if the reference luminance
+    exceeds the set_luminances max.
+
+SkiaRenderer already tone maps all HDR content to the display's HDR
+headroom, so the actual peak of the primary plane is known. This CL:
+  * Computes primary plane HDR metadata in viz on Ozone. When the root
+    render pass has HDR content, max_cll and the mastering max are set
+    to SDR white × the display's HDR headroom; otherwise they are set
+    to SDR white. max_fall is SDR white. KWin then neither tone maps
+    (so SDR doesn't get dark) nor clips HDR highlights. This replaces
+    the max_cll = ref workaround with correct values.
+  * Cleans up the creator params sent by WaylandWpColorManager:
+    - The set_luminances max is the content peak (>= the reference
+      luminance), for PQ too. The protocol says it is ignored for PQ,
+      but Hyprland tone maps when it exceeds the display peak, so
+      sending 10000 would dim the whole surface there. mutter requires
+      it to be >= the reference luminance.
+    - max_cll is never below the reference luminance, and max_fall
+      never exceeds max_cll.
+    - When mastering luminance is sent, its max is never below the
+      reference luminance, and max_cll/max_fall are clamped to it.
+      Weston raises a protocol error if they exceed it.
+    - When CLLI is missing, max_cll falls back to the content's max
+      luminance (1000 nits by default), which matches what viz assumes
+      when tone mapping. This only affects overlays now.
+    - Mastering primaries are only sent if valid, and luminances are
+      capped at 10000.
+  * Adds a wp_color_manager_v1 implementation to the Wayland test
+    server, plus ozone_unittests covering the primary plane with HDR
+    and SDR content, an overlay with MDCV/CLLI, an overlay without
+    metadata, CLL below the reference luminance (PQ and HLG),
+    compositors without mastering support, CLL above the mastering
+    peak, and a mastering peak below the reference luminance. The test
+    server rejects a reference luminance above the max luminance (like
+    mutter) and CLL/FALL above the mastering peak (like Weston). Adds
+    viz_unittests for the primary plane metadata.
+
+Fixed: 577131189
+Fixed: 486197634
+Change-Id: I6145ba15048819371b9e08c4833af92eed50d71b
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/8641498
+Reviewed-by: Saifuddin Hitawala <hitawala@chromium.org>
+Commit-Queue: Thomas Anderson <thomasanderson@chromium.org>
+Reviewed-by: Kramer Ge <fangzhoug@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1727705}
+---
+ .../viz/service/display/direct_renderer.cc    |   5 +
+ .../display/overlay_processor_interface.cc    |  30 ++
+ .../display/overlay_processor_interface.h     |  21 +
+ .../overlay_processor_ozone_unittest.cc       | 105 ++++
+ ui/ozone/platform/wayland/BUILD.gn            |   4 +
+ .../wayland/host/wayland_wp_color_manager.cc  |  81 ++-
+ .../host/wayland_wp_color_manager_unittest.cc | 341 +++++++++++++
+ .../test/test_wayland_server_thread.cc        |   4 +
+ .../wayland/test/test_wayland_server_thread.h |   5 +
+ .../wayland/test/test_wp_color_manager.cc     | 473 ++++++++++++++++++
+ .../wayland/test/test_wp_color_manager.h      |  97 ++++
+ 11 files changed, 1142 insertions(+), 24 deletions(-)
+ create mode 100644 ui/ozone/platform/wayland/host/wayland_wp_color_manager_unittest.cc
+ create mode 100644 ui/ozone/platform/wayland/test/test_wp_color_manager.cc
+ create mode 100644 ui/ozone/platform/wayland/test/test_wp_color_manager.h
+
+diff --git a/components/viz/service/display/direct_renderer.cc b/components/viz/service/display/direct_renderer.cc
+index 524d48f1ad1a24..25e92484578acb 100644
+--- a/components/viz/service/display/direct_renderer.cc
++++ b/components/viz/service/display/direct_renderer.cc
+@@ -300,6 +300,11 @@ void DirectRenderer::DrawFrame(
+             .si_format = frame_si_format,
+             .color_space = frame_color_space,
+ #if BUILDFLAG(IS_OZONE)
++            // Ozone/Wayland forwards this to the system compositor.
++            .hdr_metadata =
++                OverlayProcessorInterface::ComputePrimaryPlaneHDRMetadata(
++                    current_frame()->display_color_spaces, frame_color_space,
++                    current_frame()->root_render_pass->content_color_usage),
+             .overlay_testing_mailbox =
+                 output_surface_->capabilities().renderer_allocates_images
+                     ? GetPrimaryPlaneOverlayTestingMailbox()
+diff --git a/components/viz/service/display/overlay_processor_interface.cc b/components/viz/service/display/overlay_processor_interface.cc
+index a1a9685c3c7664..6f24405f80b08b 100644
+--- a/components/viz/service/display/overlay_processor_interface.cc
++++ b/components/viz/service/display/overlay_processor_interface.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "components/viz/service/display/overlay_processor_interface.h"
+ 
++#include <algorithm>
+ #include <utility>
+ 
+ #include "base/memory/ptr_util.h"
+@@ -16,6 +17,7 @@
+ #include "components/viz/service/display/display_compositor_memory_and_task_controller.h"
+ #include "components/viz/service/display/overlay_processor_stub.h"
+ #include "components/viz/service/display_embedder/skia_output_surface_dependency.h"
++#include "ui/gfx/display_color_spaces.h"
+ #include "ui/gfx/overlay_priority_hint.h"
+ 
+ #if BUILDFLAG(IS_APPLE)
+@@ -218,6 +220,7 @@ OverlayCandidate OverlayProcessorInterface::CreatePrimaryPlane(
+ 
+   overlay_plane.format = params.si_format;
+   overlay_plane.color_space = params.color_space;
++  overlay_plane.hdr_metadata = params.hdr_metadata;
+ 
+ #if BUILDFLAG(IS_OZONE)
+   overlay_plane.mailbox = params.overlay_testing_mailbox;
+@@ -235,6 +238,33 @@ OverlayCandidate OverlayProcessorInterface::CreatePrimaryPlane(
+   return overlay_plane;
+ }
+ 
++// static
++gfx::HDRMetadata OverlayProcessorInterface::ComputePrimaryPlaneHDRMetadata(
++    const gfx::DisplayColorSpaces& display_color_spaces,
++    const gfx::ColorSpace& output_color_space,
++    gfx::ContentColorUsage content_color_usage) {
++  if (!output_color_space.IsHDR()) {
++    return gfx::HDRMetadata();
++  }
++
++  const float sdr_white = display_color_spaces.GetSDRMaxLuminanceNits();
++  float peak = sdr_white;
++  if (content_color_usage == gfx::ContentColorUsage::kHDR) {
++    peak *= std::max(1.f, display_color_spaces.GetHDRMaxLuminanceRelative());
++  }
++
++  return gfx::HDRMetadata(
++      skhdr::MasteringDisplayColorVolume{
++          .fDisplayPrimaries = output_color_space.GetPrimaries(),
++          .fMaximumDisplayMasteringLuminance = peak,
++          .fMinimumDisplayMasteringLuminance = 0.f,
++      },
++      skhdr::ContentLightLevelInformation{
++          .fMaxCLL = peak,
++          .fMaxFALL = sdr_white,
++      });
++}
++
+ void OverlayProcessorInterface::ScheduleOverlays(
+     DisplayResourceProvider* display_resource_provider) {}
+ 
+diff --git a/components/viz/service/display/overlay_processor_interface.h b/components/viz/service/display/overlay_processor_interface.h
+index 4cbf798ad993bf..1750ed39292c8a 100644
+--- a/components/viz/service/display/overlay_processor_interface.h
++++ b/components/viz/service/display/overlay_processor_interface.h
+@@ -24,6 +24,7 @@
+ #include "ui/gfx/color_space.h"
+ #include "ui/gfx/geometry/rrect_f.h"
+ #include "ui/gfx/geometry/size.h"
++#include "ui/gfx/hdr_metadata.h"
+ #include "ui/gfx/overlay_priority_hint.h"
+ #include "ui/gfx/swap_result.h"
+ 
+@@ -39,6 +40,10 @@ namespace gpu {
+ class SharedImageManager;
+ }
+ 
++namespace gfx {
++class DisplayColorSpaces;
++}
++
+ namespace viz {
+ struct DebugRendererSettings;
+ class DisplayResourceProvider;
+@@ -102,6 +107,10 @@ class VIZ_SERVICE_EXPORT OverlayProcessorInterface {
+     // Android to determine the output color space, especially for HDR output.
+     const gfx::ColorSpace color_space;
+ 
++    // HDR metadata describing the contents of the primary plane. See
++    // ComputePrimaryPlaneHDRMetadata().
++    gfx::HDRMetadata hdr_metadata;
++
+ #if BUILDFLAG(IS_OZONE)
+     // Ozone requires checking for overlay support with an actual buffer. To
+     // create the primary plane, `OverlayProcessorOzone` will use an existing
+@@ -164,6 +173,18 @@ class VIZ_SERVICE_EXPORT OverlayProcessorInterface {
+   // Notifies the OverlayProcessor about the status of the last swap.
+   virtual void OnSwapBuffersComplete(gfx::SwapResult swap_result) {}
+ 
++  // Returns HDR metadata that describes the primary plane after the renderer
++  // has composited the root render pass into `output_color_space`. All HDR
++  // content is tone mapped to at most the display's HDR headroom, so the peak
++  // luminance of the plane is the SDR white level scaled by that headroom when
++  // the root render pass has HDR content, and the SDR white level otherwise.
++  // The frame-average light level is reported as the SDR white level.
++  // Returns empty metadata if `output_color_space` is not HDR.
++  static gfx::HDRMetadata ComputePrimaryPlaneHDRMetadata(
++      const gfx::DisplayColorSpaces& display_color_spaces,
++      const gfx::ColorSpace& output_color_space,
++      gfx::ContentColorUsage content_color_usage);
++
+  protected:
+   OverlayProcessorInterface() = default;
+ 
+diff --git a/components/viz/service/display/overlay_processor_ozone_unittest.cc b/components/viz/service/display/overlay_processor_ozone_unittest.cc
+index 5cf3a3f0fd645a..eddab9f6ba7048 100644
+--- a/components/viz/service/display/overlay_processor_ozone_unittest.cc
++++ b/components/viz/service/display/overlay_processor_ozone_unittest.cc
+@@ -13,6 +13,9 @@
+ #include "gpu/command_buffer/service/shared_image/shared_image_manager.h"
+ #include "testing/gmock/include/gmock/gmock.h"
+ #include "testing/gtest/include/gtest/gtest.h"
++#include "ui/gfx/color_space.h"
++#include "ui/gfx/display_color_spaces.h"
++#include "ui/gfx/hdr_metadata.h"
+ #include "ui/gfx/linux/native_pixmap_dmabuf.h"
+ #include "ui/gfx/native_pixmap.h"
+ #include "ui/gfx/native_pixmap_handle.h"
+@@ -251,11 +254,113 @@ TEST(OverlayProcessorOzoneTest, ColorSpaceMismatch) {
+ // that's already tested in overlay_unittest.cc.
+ class TestOverlayProcessorOzone : public OverlayProcessorOzone {
+  public:
++  using OverlayProcessorOzone::CreatePrimaryPlane;
+   using OverlayProcessorOzone::OverlayProcessorOzone;
+ 
+   int MaxOverlaysConsidered() { return max_overlays_considered_; }
+ };
+ 
++// SDR output color spaces must not get any HDR metadata.
++TEST(OverlayProcessorOzoneTest, PrimaryPlaneHDRMetadataSDROutput) {
++  gfx::DisplayColorSpaces display_color_spaces(gfx::ColorSpace::CreateSRGB());
++  EXPECT_TRUE(OverlayProcessorInterface::ComputePrimaryPlaneHDRMetadata(
++                  display_color_spaces, gfx::ColorSpace::CreateSRGB(),
++                  gfx::ContentColorUsage::kSRGB)
++                  .IsEmpty());
++  EXPECT_TRUE(OverlayProcessorInterface::ComputePrimaryPlaneHDRMetadata(
++                  display_color_spaces, gfx::ColorSpace::CreateSRGB(),
++                  gfx::ContentColorUsage::kHDR)
++                  .IsEmpty());
++}
++
++// When the root render pass has HDR content, the primary plane's peak is the
++// SDR white level scaled by the display's HDR headroom.
++TEST(OverlayProcessorOzoneTest, PrimaryPlaneHDRMetadataHDRContent) {
++  constexpr float kSdrWhite = 500.f;
++  constexpr float kHdrRelative = 2.f;
++  const gfx::ColorSpace output_color_space =
++      gfx::ColorSpace::CreateHDR10().GetWithSdrWhiteLevel(kSdrWhite);
++  gfx::DisplayColorSpaces display_color_spaces(output_color_space);
++  display_color_spaces.SetSDRMaxLuminanceNits(kSdrWhite);
++  display_color_spaces.SetHDRMaxLuminanceRelative(kHdrRelative);
++
++  const gfx::HDRMetadata metadata =
++      OverlayProcessorInterface::ComputePrimaryPlaneHDRMetadata(
++          display_color_spaces, output_color_space,
++          gfx::ContentColorUsage::kHDR);
++  ASSERT_TRUE(metadata.HasCLLI());
++  ASSERT_TRUE(metadata.HasMDCV());
++  EXPECT_FLOAT_EQ(metadata.GetCLLI().fMaxCLL, kSdrWhite * kHdrRelative);
++  EXPECT_FLOAT_EQ(metadata.GetCLLI().fMaxFALL, kSdrWhite);
++  EXPECT_FLOAT_EQ(metadata.GetMDCV().fMaximumDisplayMasteringLuminance,
++                  kSdrWhite * kHdrRelative);
++  EXPECT_FLOAT_EQ(metadata.GetMDCV().fMinimumDisplayMasteringLuminance, 0.f);
++  EXPECT_EQ(metadata.GetMDCV().fDisplayPrimaries,
++            output_color_space.GetPrimaries());
++  EXPECT_FALSE(metadata.HasAgtm());
++}
++
++// When the root render pass has no HDR content but is still output in an HDR
++// color space, the primary plane's peak is the SDR white level.
++TEST(OverlayProcessorOzoneTest, PrimaryPlaneHDRMetadataSDRContent) {
++  constexpr float kSdrWhite = 203.f;
++  const gfx::ColorSpace output_color_space =
++      gfx::ColorSpace::CreateHDR10().GetWithSdrWhiteLevel(kSdrWhite);
++  gfx::DisplayColorSpaces display_color_spaces(output_color_space);
++  display_color_spaces.SetSDRMaxLuminanceNits(kSdrWhite);
++  display_color_spaces.SetHDRMaxLuminanceRelative(4.f);
++
++  for (auto usage : {gfx::ContentColorUsage::kSRGB,
++                     gfx::ContentColorUsage::kWideColorGamut}) {
++    const gfx::HDRMetadata metadata =
++        OverlayProcessorInterface::ComputePrimaryPlaneHDRMetadata(
++            display_color_spaces, output_color_space, usage);
++    ASSERT_TRUE(metadata.HasCLLI());
++    ASSERT_TRUE(metadata.HasMDCV());
++    EXPECT_FLOAT_EQ(metadata.GetCLLI().fMaxCLL, kSdrWhite);
++    EXPECT_FLOAT_EQ(metadata.GetCLLI().fMaxFALL, kSdrWhite);
++    EXPECT_FLOAT_EQ(metadata.GetMDCV().fMaximumDisplayMasteringLuminance,
++                    kSdrWhite);
++  }
++}
++
++// A display that reports less than 1x headroom must not produce a peak below
++// the SDR white level.
++TEST(OverlayProcessorOzoneTest, PrimaryPlaneHDRMetadataNoHeadroom) {
++  constexpr float kSdrWhite = 300.f;
++  const gfx::ColorSpace output_color_space = gfx::ColorSpace::CreateHLG();
++  gfx::DisplayColorSpaces display_color_spaces(output_color_space);
++  display_color_spaces.SetSDRMaxLuminanceNits(kSdrWhite);
++  display_color_spaces.SetHDRMaxLuminanceRelative(0.5f);
++
++  const gfx::HDRMetadata metadata =
++      OverlayProcessorInterface::ComputePrimaryPlaneHDRMetadata(
++          display_color_spaces, output_color_space,
++          gfx::ContentColorUsage::kHDR);
++  ASSERT_TRUE(metadata.HasCLLI());
++  EXPECT_FLOAT_EQ(metadata.GetCLLI().fMaxCLL, kSdrWhite);
++}
++
++// The primary plane candidate carries the HDR metadata from its params.
++TEST(OverlayProcessorOzoneTest, PrimaryPlaneCarriesHDRMetadata) {
++  const gfx::ColorSpace output_color_space = gfx::ColorSpace::CreateHDR10();
++  const gfx::HDRMetadata metadata(skhdr::ContentLightLevelInformation{
++      .fMaxCLL = 1234.f, .fMaxFALL = 203.f});
++  const OverlayCandidate primary_plane =
++      TestOverlayProcessorOzone::CreatePrimaryPlane(
++          OverlayProcessorInterface::PrimaryPlaneParams{
++              .viewport_size = gfx::Size(64, 64),
++              .resource_size_in_pixels = gfx::Size(64, 64),
++              .supports_hdr = true,
++              .si_format = SinglePlaneFormat::kRGBA_1010102,
++              .color_space = output_color_space,
++              .hdr_metadata = metadata,
++          });
++  EXPECT_TRUE(primary_plane.is_root_render_pass);
++  EXPECT_EQ(primary_plane.color_space, output_color_space);
++  EXPECT_EQ(primary_plane.hdr_metadata, metadata);
++}
++
+ TEST(OverlayProcessorOzoneTest, ObserveHardwareCapabilites) {
+   OverlayCandidateList candidates;
+   // Enable 4 overlays
+diff --git a/ui/ozone/platform/wayland/BUILD.gn b/ui/ozone/platform/wayland/BUILD.gn
+index aeb3e4591055ca..8c3d9804f1ba93 100644
+--- a/ui/ozone/platform/wayland/BUILD.gn
++++ b/ui/ozone/platform/wayland/BUILD.gn
+@@ -468,6 +468,8 @@ source_set("test_support") {
+     "test/test_viewporter.h",
+     "test/test_wayland_server_thread.cc",
+     "test/test_wayland_server_thread.h",
++    "test/test_wp_color_manager.cc",
++    "test/test_wp_color_manager.h",
+     "test/test_wp_linux_drm_syncobj.cc",
+     "test/test_wp_linux_drm_syncobj.h",
+     "test/test_wp_pointer_gestures.cc",
+@@ -504,6 +506,7 @@ source_set("test_support") {
+     "//third_party/wayland:wayland_client",
+     "//third_party/wayland:wayland_server",
+     "//third_party/wayland-protocols:alpha_compositing_protocol",
++    "//third_party/wayland-protocols:color_management_protocol",
+     "//third_party/wayland-protocols:fractional_scale_protocol",
+     "//third_party/wayland-protocols:gtk_primary_selection_protocol",
+     "//third_party/wayland-protocols:linux_dmabuf_protocol",
+@@ -551,6 +554,7 @@ source_set("wayland_unittests") {
+     "host/wayland_window_drag_controller_unittest.cc",
+     "host/wayland_window_manager_unittest.cc",
+     "host/wayland_window_unittest.cc",
++    "host/wayland_wp_color_manager_unittest.cc",
+     "host/wayland_zwp_pointer_gestures_unittest.cc",
+     "host/xdg_activation_unittest.cc",
+     "host/xdg_toplevel_icon_unittest.cc",
+diff --git a/ui/ozone/platform/wayland/host/wayland_wp_color_manager.cc b/ui/ozone/platform/wayland/host/wayland_wp_color_manager.cc
+index 9498a869f79721..9602adaf7933a5 100644
+--- a/ui/ozone/platform/wayland/host/wayland_wp_color_manager.cc
++++ b/ui/ozone/platform/wayland/host/wayland_wp_color_manager.cc
+@@ -6,8 +6,12 @@
+ 
+ #include <color-management-v1-client-protocol.h>
+ 
++#include <algorithm>
++
+ #include "base/feature_list.h"
+ #include "base/logging.h"
++#include "base/numerics/safe_conversions.h"
++#include "skia/ext/skcolorspace_primaries.h"
+ #include "ui/ozone/platform/wayland/host/wayland_connection.h"
+ #include "ui/ozone/platform/wayland/host/wayland_output_manager.h"
+ 
+@@ -279,11 +283,34 @@ bool WaylandWpColorManager::PopulateDescriptionCreator(
+   }
+ 
+   if (color_space.IsHDR()) {
++    const uint32_t ref_luma = std::max<uint32_t>(
++        1, base::ClampRound<uint32_t>(
++               gfx::HDRMetadata::GetWaylandReferenceLuminance(color_space,
++                                                              hdr_metadata)));
++
++    // The content light levels. When the content light level is unknown,
++    // assume the same peak that tone mapping in viz assumes for HDR content
++    // without metadata. The primary plane always carries explicit metadata
++    // describing its peak, so this fallback only applies to overlays. Never
++    // report a content light level below the reference luminance, since that
++    // claims reference white is unreachable, which compositors may handle by
++    // clipping. Luminances are capped at the maximum that PQ can represent.
++    constexpr float kMaxLuminance = 10000.f;
++    uint32_t cll = std::max<uint32_t>(
++        ref_luma, base::ClampRound<uint32_t>(std::min(
++                      kMaxLuminance,
++                      gfx::HDRMetadata::GetContentMaxLuminance(hdr_metadata))));
++    uint32_t fall = ref_luma;
++    if (hdr_metadata.HasCLLI() && hdr_metadata.GetCLLI().fMaxFALL > 0) {
++      fall = hdr_metadata.GetCLLI().getUint16MaxFALL();
++    }
++
+     if (IsSupportedFeature(
+-            WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES)) {
+-      if (hdr_metadata.HasMDCV()) {
+-        const auto& mdcv = hdr_metadata.GetMDCV();
+-        const auto& primaries = mdcv.fDisplayPrimaries;
++            WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES) &&
++        hdr_metadata.HasMDCV()) {
++      const auto& mdcv = hdr_metadata.GetMDCV();
++      const auto& primaries = mdcv.fDisplayPrimaries;
++      if (primaries != SkNamedPrimariesExt::kInvalid) {
+         wp_image_description_creator_params_v1_set_mastering_display_primaries(
+             creator, static_cast<int32_t>(primaries.fRX * 1000000),
+             static_cast<int32_t>(primaries.fRY * 1000000),
+@@ -293,34 +320,40 @@ bool WaylandWpColorManager::PopulateDescriptionCreator(
+             static_cast<int32_t>(primaries.fBY * 1000000),
+             static_cast<int32_t>(primaries.fWX * 1000000),
+             static_cast<int32_t>(primaries.fWY * 1000000));
++      }
+ 
++      if (mdcv.fMaximumDisplayMasteringLuminance > 0.f) {
++        // Like the content light level, never report a mastering peak below
++        // the reference luminance.
++        const uint32_t mastering_max = std::max<uint32_t>(
++            ref_luma,
++            base::ClampRound<uint32_t>(std::min(
++                kMaxLuminance, mdcv.fMaximumDisplayMasteringLuminance)));
++        // The protocol requires max > min for the mastering luminance.
++        const uint32_t mastering_min = std::min<uint32_t>(
++            base::ClampRound<uint32_t>(
++                std::max(0.f, mdcv.fMinimumDisplayMasteringLuminance) * 10000),
++            mastering_max * 10000 - 1);
+         wp_image_description_creator_params_v1_set_mastering_luminance(
+-            creator,
+-            static_cast<uint32_t>(mdcv.fMinimumDisplayMasteringLuminance *
+-                                  10000),
+-            static_cast<uint32_t>(mdcv.fMaximumDisplayMasteringLuminance));
++            creator, mastering_min, mastering_max);
++        // Some compositors (e.g. Weston) require max_cll and max_fall to not
++        // exceed the mastering peak. `mastering_max` >= `ref_luma`, so `cll`
++        // stays >= `ref_luma`.
++        cll = std::min(cll, mastering_max);
+       }
+     }
++    fall = std::min(fall, cll);
+ 
+-    const float ref_luma = gfx::HDRMetadata::GetWaylandReferenceLuminance(
+-        color_space, hdr_metadata);
+     if (IsSupportedFeature(WP_COLOR_MANAGER_V1_FEATURE_SET_LUMINANCES)) {
+-      wp_image_description_creator_params_v1_set_luminances(
+-          creator, 0, gfx::HDRMetadata::GetContentMaxLuminance(hdr_metadata),
+-          ref_luma);
++      // Use the content peak as the primary color volume's max luminance.
++      // The protocol says `max_lum` is ignored for PQ, but some compositors
++      // (e.g. Hyprland) tone map based on it, so it must not exceed the
++      // content's actual peak. `cll` >= `ref_luma`, which some compositors
++      // (e.g. mutter) require.
++      wp_image_description_creator_params_v1_set_luminances(creator, 0, cll,
++                                                            ref_luma);
+     }
+ 
+-    uint32_t cll = ref_luma;
+-    uint32_t fall = ref_luma;
+-    if (hdr_metadata.HasCLLI()) {
+-      const auto& clli = hdr_metadata.GetCLLI();
+-      if (clli.fMaxCLL > 0) {
+-        cll = clli.getUint16MaxCLL();
+-      }
+-      if (clli.fMaxFALL > 0) {
+-        fall = clli.getUint16MaxFALL();
+-      }
+-    }
+     wp_image_description_creator_params_v1_set_max_cll(creator, cll);
+     wp_image_description_creator_params_v1_set_max_fall(creator, fall);
+   }
+diff --git a/ui/ozone/platform/wayland/host/wayland_wp_color_manager_unittest.cc b/ui/ozone/platform/wayland/host/wayland_wp_color_manager_unittest.cc
+new file mode 100644
+index 00000000000000..7fde4896fe1eb8
+--- /dev/null
++++ b/ui/ozone/platform/wayland/host/wayland_wp_color_manager_unittest.cc
+@@ -0,0 +1,341 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ui/ozone/platform/wayland/host/wayland_wp_color_manager.h"
++
++#include <color-management-v1-server-protocol.h>
++
++#include <array>
++#include <cstdint>
++#include <optional>
++
++#include "base/test/bind.h"
++#include "skia/ext/skcolorspace_primaries.h"
++#include "testing/gmock/include/gmock/gmock.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/gfx/color_space.h"
++#include "ui/gfx/hdr_metadata.h"
++#include "ui/ozone/platform/wayland/host/wayland_connection.h"
++#include "ui/ozone/platform/wayland/host/wayland_surface.h"
++#include "ui/ozone/platform/wayland/host/wayland_window.h"
++#include "ui/ozone/platform/wayland/test/mock_surface.h"
++#include "ui/ozone/platform/wayland/test/test_wayland_server_thread.h"
++#include "ui/ozone/platform/wayland/test/test_wp_color_manager.h"
++#include "ui/ozone/platform/wayland/test/wayland_test.h"
++
++namespace ui {
++
++namespace {
++
++constexpr int32_t ToWaylandChromaticity(float value) {
++  return static_cast<int32_t>(value * 1000000);
++}
++
++std::array<int32_t, 8> ToWaylandPrimaries(const SkColorSpacePrimaries& p) {
++  return {ToWaylandChromaticity(p.fRX), ToWaylandChromaticity(p.fRY),
++          ToWaylandChromaticity(p.fGX), ToWaylandChromaticity(p.fGY),
++          ToWaylandChromaticity(p.fBX), ToWaylandChromaticity(p.fBY),
++          ToWaylandChromaticity(p.fWX), ToWaylandChromaticity(p.fWY)};
++}
++
++}  // namespace
++
++class WaylandWpColorManagerTest : public WaylandTestSimple {
++ public:
++  WaylandWpColorManagerTest()
++      : WaylandTestSimple({.supports_color_management = true}) {}
++
++  void SetUp() override {
++    WaylandTestSimple::SetUp();
++    ASSERT_TRUE(connection_->wp_color_manager());
++    ASSERT_TRUE(connection_->wp_color_manager()->ready());
++  }
++
++ protected:
++  // Creates an image description directly through the color manager, as is
++  // done for overlay planes, and returns the parameters the server received.
++  wl::TestImageDescriptionParams CreateImageDescription(
++      const gfx::ColorSpace& color_space,
++      const gfx::HDRMetadata& hdr_metadata) {
++    bool created = false;
++    connection_->wp_color_manager()->GetImageDescription(
++        color_space, hdr_metadata,
++        base::BindLambdaForTesting(
++            [&](scoped_refptr<WaylandWpImageDescription> description) {
++              created = !!description;
++            }));
++    SyncDisplay();
++    EXPECT_TRUE(created);
++
++    wl::TestImageDescriptionParams params;
++    PostToServerAndWait([&](wl::TestWaylandServerThread* server) {
++      const auto& descriptions =
++          server->wp_color_manager()->created_descriptions();
++      ASSERT_FALSE(descriptions.empty());
++      params = descriptions.back();
++    });
++    return params;
++  }
++
++  // Sets the image description of the root surface, as is done for the
++  // primary plane, and returns the parameters the server received.
++  std::optional<wl::TestImageDescriptionParams> SetRootSurfaceImageDescription(
++      const gfx::ColorSpace& color_space,
++      const gfx::HDRMetadata& hdr_metadata) {
++    WaylandSurface* surface = window_->root_surface();
++    surface->SetImageDescription(color_space, hdr_metadata);
++    surface->ApplyPendingState();
++    surface->Commit();
++    // One roundtrip for the image description to become ready, and one for
++    // the resulting set_image_description request.
++    SyncDisplay();
++    SyncDisplay();
++
++    std::optional<wl::TestImageDescriptionParams> params;
++    const uint32_t surface_id = surface->get_surface_id();
++    PostToServerAndWait([&](wl::TestWaylandServerThread* server) {
++      auto* mock_surface = server->GetObject<wl::MockSurface>(surface_id);
++      ASSERT_TRUE(mock_surface);
++      params = server->wp_color_manager()->GetSurfaceImageDescription(
++          mock_surface->resource());
++    });
++    return params;
++  }
++};
++
++// The primary plane with HDR content describes its post-tone-mapping peak:
++// the SDR white level scaled by the display's headroom. The compositor must
++// receive that peak as max_cll instead of the reference luminance, otherwise
++// compositors that clip to the content's peak (e.g. KWin 6.8+) clip all HDR
++// highlights to SDR white.
++TEST_F(WaylandWpColorManagerTest, PrimaryPlaneWithHdrContent) {
++  constexpr float kSdrWhite = 500.f;
++  constexpr float kPeak = 1000.f;
++  const gfx::ColorSpace color_space =
++      gfx::ColorSpace::CreateHDR10().GetWithSdrWhiteLevel(kSdrWhite);
++  const gfx::HDRMetadata hdr_metadata(
++      skhdr::MasteringDisplayColorVolume{
++          .fDisplayPrimaries = color_space.GetPrimaries(),
++          .fMaximumDisplayMasteringLuminance = kPeak,
++          .fMinimumDisplayMasteringLuminance = 0.f,
++      },
++      skhdr::ContentLightLevelInformation{.fMaxCLL = kPeak,
++                                          .fMaxFALL = kSdrWhite});
++
++  auto params = SetRootSurfaceImageDescription(color_space, hdr_metadata);
++  ASSERT_TRUE(params);
++  EXPECT_EQ(params->tf_named, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
++  EXPECT_EQ(params->primaries_named, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
++  ASSERT_TRUE(params->luminances);
++  EXPECT_EQ(params->luminances->min, 0u);
++  // The max luminance is the content peak, not 10000, even for PQ. Some
++  // compositors (e.g. Hyprland) tone map when it exceeds the display peak.
++  EXPECT_EQ(params->luminances->max, kPeak);
++  EXPECT_EQ(params->luminances->reference, kSdrWhite);
++  EXPECT_EQ(params->mastering_display_primaries,
++            ToWaylandPrimaries(color_space.GetPrimaries()));
++  ASSERT_TRUE(params->mastering_luminance);
++  EXPECT_EQ(params->mastering_luminance->min, 0u);
++  EXPECT_EQ(params->mastering_luminance->max, kPeak);
++  EXPECT_EQ(params->max_cll, kPeak);
++  EXPECT_EQ(params->max_fall, kSdrWhite);
++}
++
++// The primary plane without HDR content (but in an HDR color space) reports a
++// peak of SDR white, so compositors don't tone map SDR content.
++TEST_F(WaylandWpColorManagerTest, PrimaryPlaneWithSdrContent) {
++  constexpr float kSdrWhite = 203.f;
++  const gfx::ColorSpace color_space =
++      gfx::ColorSpace::CreateHDR10().GetWithSdrWhiteLevel(kSdrWhite);
++  const gfx::HDRMetadata hdr_metadata(
++      skhdr::MasteringDisplayColorVolume{
++          .fDisplayPrimaries = color_space.GetPrimaries(),
++          .fMaximumDisplayMasteringLuminance = kSdrWhite,
++          .fMinimumDisplayMasteringLuminance = 0.f,
++      },
++      skhdr::ContentLightLevelInformation{.fMaxCLL = kSdrWhite,
++                                          .fMaxFALL = kSdrWhite});
++
++  auto params = SetRootSurfaceImageDescription(color_space, hdr_metadata);
++  ASSERT_TRUE(params);
++  ASSERT_TRUE(params->luminances);
++  EXPECT_EQ(params->luminances->max, kSdrWhite);
++  EXPECT_EQ(params->luminances->reference, kSdrWhite);
++  ASSERT_TRUE(params->mastering_luminance);
++  EXPECT_EQ(params->mastering_luminance->max, kSdrWhite);
++  EXPECT_EQ(params->max_cll, kSdrWhite);
++  EXPECT_EQ(params->max_fall, kSdrWhite);
++}
++
++// An overlay (e.g. a video) forwards its stream's MDCV and CLLI metadata.
++TEST_F(WaylandWpColorManagerTest, OverlayWithMdcvAndClli) {
++  const gfx::ColorSpace color_space = gfx::ColorSpace::CreateHDR10();
++  const SkColorSpacePrimaries mastering_primaries =
++      SkNamedPrimaries::kSMPTE_EG_432_1;
++  const gfx::HDRMetadata hdr_metadata(
++      skhdr::MasteringDisplayColorVolume{
++          .fDisplayPrimaries = mastering_primaries,
++          .fMaximumDisplayMasteringLuminance = 4000.f,
++          .fMinimumDisplayMasteringLuminance = 0.005f,
++      },
++      skhdr::ContentLightLevelInformation{.fMaxCLL = 1500.f,
++                                          .fMaxFALL = 400.f});
++
++  auto params = CreateImageDescription(color_space, hdr_metadata);
++  EXPECT_EQ(params.tf_named, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
++  EXPECT_EQ(params.primaries_named, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
++  ASSERT_TRUE(params.luminances);
++  EXPECT_EQ(params.luminances->max, 1500u);
++  EXPECT_EQ(params.luminances->reference,
++            gfx::ColorSpace::kDefaultSDRWhiteLevel);
++  EXPECT_EQ(params.mastering_display_primaries,
++            ToWaylandPrimaries(mastering_primaries));
++  ASSERT_TRUE(params.mastering_luminance);
++  EXPECT_EQ(params.mastering_luminance->min, 50u);
++  EXPECT_EQ(params.mastering_luminance->max, 4000u);
++  EXPECT_EQ(params.max_cll, 1500u);
++  EXPECT_EQ(params.max_fall, 400u);
++}
++
++// An HDR overlay without metadata assumes the default HDR10 peak of 1000 nits,
++// matching what viz assumes when tone mapping such content.
++TEST_F(WaylandWpColorManagerTest, OverlayWithoutMetadata) {
++  auto params = CreateImageDescription(gfx::ColorSpace::CreateHDR10(),
++                                       gfx::HDRMetadata());
++  ASSERT_TRUE(params.luminances);
++  EXPECT_EQ(params.luminances->max, 1000u);
++  EXPECT_EQ(params.luminances->reference,
++            gfx::ColorSpace::kDefaultSDRWhiteLevel);
++  EXPECT_FALSE(params.mastering_display_primaries);
++  EXPECT_FALSE(params.mastering_luminance);
++  EXPECT_EQ(params.max_cll, 1000u);
++  EXPECT_EQ(params.max_fall, gfx::ColorSpace::kDefaultSDRWhiteLevel);
++}
++
++// A max_cll below the reference luminance is raised to the reference
++// luminance, and max_fall never exceeds max_cll.
++TEST_F(WaylandWpColorManagerTest, ClliBelowReferenceLuminancePQ) {
++  constexpr float kSdrWhite = 300.f;
++  const gfx::ColorSpace color_space =
++      gfx::ColorSpace::CreateHDR10().GetWithSdrWhiteLevel(kSdrWhite);
++  const gfx::HDRMetadata hdr_metadata(
++      skhdr::ContentLightLevelInformation{.fMaxCLL = 150.f, .fMaxFALL = 100.f});
++
++  auto params = CreateImageDescription(color_space, hdr_metadata);
++  ASSERT_TRUE(params.luminances);
++  EXPECT_EQ(params.luminances->max, kSdrWhite);
++  EXPECT_EQ(params.luminances->reference, kSdrWhite);
++  EXPECT_EQ(params.max_cll, kSdrWhite);
++  EXPECT_EQ(params.max_fall, 100u);
++}
++
++// For non-PQ transfer functions, the primary color volume's max luminance must
++// not be below the reference luminance. Some compositors (e.g. mutter) raise a
++// protocol error if it is.
++TEST_F(WaylandWpColorManagerTest, ClliBelowReferenceLuminanceHLG) {
++  const gfx::ColorSpace color_space = gfx::ColorSpace::CreateHLG();
++  const gfx::HDRMetadata hdr_metadata(
++      skhdr::ContentLightLevelInformation{.fMaxCLL = 100.f, .fMaxFALL = 400.f});
++
++  auto params = CreateImageDescription(color_space, hdr_metadata);
++  EXPECT_EQ(params.tf_named, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG);
++  ASSERT_TRUE(params.luminances);
++  EXPECT_GT(params.luminances->reference, 100u);
++  EXPECT_GE(params.luminances->max, params.luminances->reference);
++  ASSERT_TRUE(params.max_cll);
++  ASSERT_TRUE(params.max_fall);
++  EXPECT_EQ(*params.max_cll, params.luminances->reference);
++  EXPECT_LE(*params.max_fall, *params.max_cll);
++}
++
++// max_cll and max_fall are clamped to the mastering peak. Some compositors
++// (e.g. Weston) raise a protocol error otherwise.
++TEST_F(WaylandWpColorManagerTest, ClliAboveMasteringMax) {
++  const gfx::HDRMetadata hdr_metadata(
++      skhdr::MasteringDisplayColorVolume{
++          .fDisplayPrimaries = SkNamedPrimaries::kRec2020,
++          .fMaximumDisplayMasteringLuminance = 1000.f,
++          .fMinimumDisplayMasteringLuminance = 0.f,
++      },
++      skhdr::ContentLightLevelInformation{.fMaxCLL = 4000.f,
++                                          .fMaxFALL = 1200.f});
++
++  auto params =
++      CreateImageDescription(gfx::ColorSpace::CreateHDR10(), hdr_metadata);
++  ASSERT_TRUE(params.mastering_luminance);
++  EXPECT_EQ(params.mastering_luminance->max, 1000u);
++  EXPECT_EQ(params.max_cll, 1000u);
++  EXPECT_EQ(params.max_fall, 1000u);
++  ASSERT_TRUE(params.luminances);
++  EXPECT_EQ(params.luminances->max, 1000u);
++}
++
++// A mastering peak below the reference luminance is raised to the reference
++// luminance, so that max_cll can be both >= the reference luminance and
++// <= the mastering peak, and the max luminance stays >= the reference
++// luminance.
++TEST_F(WaylandWpColorManagerTest, MasteringMaxBelowReferenceLuminance) {
++  constexpr uint32_t kSdrWhite = 300;
++  const gfx::ColorSpace color_space =
++      gfx::ColorSpace::CreateHDR10().GetWithSdrWhiteLevel(kSdrWhite);
++  const gfx::HDRMetadata hdr_metadata(
++      skhdr::MasteringDisplayColorVolume{
++          .fDisplayPrimaries = SkNamedPrimaries::kRec2020,
++          .fMaximumDisplayMasteringLuminance = 150.f,
++          .fMinimumDisplayMasteringLuminance = 0.f,
++      },
++      skhdr::ContentLightLevelInformation{.fMaxCLL = 120.f, .fMaxFALL = 100.f});
++
++  auto params = CreateImageDescription(color_space, hdr_metadata);
++  ASSERT_TRUE(params.mastering_luminance);
++  EXPECT_EQ(params.mastering_luminance->max, kSdrWhite);
++  EXPECT_EQ(params.max_cll, kSdrWhite);
++  EXPECT_EQ(params.max_fall, 100u);
++  ASSERT_TRUE(params.luminances);
++  EXPECT_EQ(params.luminances->max, kSdrWhite);
++  EXPECT_EQ(params.luminances->reference, kSdrWhite);
++}
++
++class WaylandWpColorManagerNoMasteringTest : public WaylandWpColorManagerTest {
++ public:
++  WaylandWpColorManagerNoMasteringTest() {
++    // Like mutter, don't advertise mastering display metadata support.
++    server_.wp_color_manager()->set_supported_features(
++        {WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC,
++         WP_COLOR_MANAGER_V1_FEATURE_SET_PRIMARIES,
++         WP_COLOR_MANAGER_V1_FEATURE_SET_LUMINANCES});
++  }
++};
++
++// Mastering metadata must not be sent if the compositor doesn't support it.
++TEST_F(WaylandWpColorManagerNoMasteringTest, NoMasteringRequests) {
++  const gfx::HDRMetadata hdr_metadata(
++      skhdr::MasteringDisplayColorVolume{
++          .fDisplayPrimaries = SkNamedPrimaries::kRec2020,
++          .fMaximumDisplayMasteringLuminance = 1000.f,
++          .fMinimumDisplayMasteringLuminance = 0.f,
++      },
++      skhdr::ContentLightLevelInformation{.fMaxCLL = 800.f, .fMaxFALL = 200.f});
++
++  auto params =
++      CreateImageDescription(gfx::ColorSpace::CreateHDR10(), hdr_metadata);
++  EXPECT_FALSE(params.mastering_display_primaries);
++  EXPECT_FALSE(params.mastering_luminance);
++  EXPECT_EQ(params.max_cll, 800u);
++  EXPECT_EQ(params.max_fall, 200u);
++}
++
++// SDR color spaces don't get any luminance or HDR metadata.
++TEST_F(WaylandWpColorManagerTest, SdrColorSpace) {
++  auto params =
++      CreateImageDescription(gfx::ColorSpace::CreateSRGB(), gfx::HDRMetadata());
++  EXPECT_EQ(params.tf_named, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB);
++  EXPECT_EQ(params.primaries_named, WP_COLOR_MANAGER_V1_PRIMARIES_SRGB);
++  EXPECT_FALSE(params.luminances);
++  EXPECT_FALSE(params.mastering_luminance);
++  EXPECT_FALSE(params.max_cll);
++  EXPECT_FALSE(params.max_fall);
++}
++
++}  // namespace ui
+diff --git a/ui/ozone/platform/wayland/test/test_wayland_server_thread.cc b/ui/ozone/platform/wayland/test/test_wayland_server_thread.cc
+index bf63c21ecbb800..53d93b5aa3e41a 100644
+--- a/ui/ozone/platform/wayland/test/test_wayland_server_thread.cc
++++ b/ui/ozone/platform/wayland/test/test_wayland_server_thread.cc
+@@ -158,6 +158,10 @@ bool TestWaylandServerThread::Start() {
+   if (!xdg_toplevel_icon_manager_v1_.Initialize(display_.get())) {
+     return false;
+   }
++  if (config_.supports_color_management &&
++      !wp_color_manager_.Initialize(display_.get())) {
++    return false;
++  }
+ 
+   client_ = wl_client_create(display_.get(), server_fd.release());
+   if (!client_)
+diff --git a/ui/ozone/platform/wayland/test/test_wayland_server_thread.h b/ui/ozone/platform/wayland/test/test_wayland_server_thread.h
+index ffb45991b6ad4e..f3c898a22c05ef 100644
+--- a/ui/ozone/platform/wayland/test/test_wayland_server_thread.h
++++ b/ui/ozone/platform/wayland/test/test_wayland_server_thread.h
+@@ -32,6 +32,7 @@
+ #include "ui/ozone/platform/wayland/test/test_seat.h"
+ #include "ui/ozone/platform/wayland/test/test_subcompositor.h"
+ #include "ui/ozone/platform/wayland/test/test_viewporter.h"
++#include "ui/ozone/platform/wayland/test/test_wp_color_manager.h"
+ #include "ui/ozone/platform/wayland/test/test_wp_linux_drm_syncobj.h"
+ #include "ui/ozone/platform/wayland/test/test_wp_pointer_gestures.h"
+ #include "ui/ozone/platform/wayland/test/test_zwp_text_input_manager.h"
+@@ -62,6 +63,8 @@ struct ServerConfig {
+   ShouldUseLinuxDrmSyncobjProtocol use_linux_drm_syncobj =
+       ShouldUseLinuxDrmSyncobjProtocol::kNone;
+   bool supports_viewporter_surface_scaling = true;
++  // Whether to advertise the wp_color_manager_v1 global.
++  bool supports_color_management = false;
+ };
+ 
+ class TestWaylandServerThread;
+@@ -142,6 +145,7 @@ class TestWaylandServerThread : public base::Thread,
+     return &wp_linux_drm_syncobj_manager_v1_;
+   }
+   MockZwpLinuxDmabufV1* zwp_linux_dmabuf_v1() { return &zwp_linux_dmabuf_v1_; }
++  TestWpColorManager* wp_color_manager() { return &wp_color_manager_; }
+ 
+   wl_display* display() const { return display_.get(); }
+ 
+@@ -220,6 +224,7 @@ class TestWaylandServerThread : public base::Thread,
+   TestWpPointerGestures wp_pointer_gestures_;
+   MockXdgActivationV1 xdg_activation_v1_;
+   MockXdgToplevelIconManagerV1 xdg_toplevel_icon_manager_v1_;
++  TestWpColorManager wp_color_manager_;
+   std::unique_ptr<TestSelectionDeviceManager> primary_selection_device_manager_;
+ 
+   std::vector<std::unique_ptr<GlobalObject>> globals_;
+diff --git a/ui/ozone/platform/wayland/test/test_wp_color_manager.cc b/ui/ozone/platform/wayland/test/test_wp_color_manager.cc
+new file mode 100644
+index 00000000000000..a5b390c7c4548f
+--- /dev/null
++++ b/ui/ozone/platform/wayland/test/test_wp_color_manager.cc
+@@ -0,0 +1,473 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ui/ozone/platform/wayland/test/test_wp_color_manager.h"
++
++#include <color-management-v1-server-protocol.h>
++
++#include <utility>
++
++#include "base/check.h"
++#include "base/functional/callback_helpers.h"
++#include "base/memory/raw_ptr.h"
++#include "ui/ozone/platform/wayland/test/server_object.h"
++
++namespace wl {
++
++namespace {
++
++constexpr uint32_t kTestWpColorManagerVersion = 1;
++
++// An image description. `params` is set for descriptions created by the client
++// from a parametric creator, and unset for descriptions created by the server
++// (e.g. for outputs or surface feedback).
++class TestImageDescription : public ServerObject {
++ public:
++  TestImageDescription(wl_resource* resource,
++                       std::optional<TestImageDescriptionParams> params)
++      : ServerObject(resource), params_(std::move(params)) {}
++  ~TestImageDescription() override = default;
++
++  const std::optional<TestImageDescriptionParams>& params() const {
++    return params_;
++  }
++
++ private:
++  const std::optional<TestImageDescriptionParams> params_;
++};
++
++void ImageDescriptionGetInformation(wl_client* client,
++                                    wl_resource* resource,
++                                    uint32_t id) {
++  wl_resource* info =
++      wl_resource_create(client, &wp_image_description_info_v1_interface,
++                         wl_resource_get_version(resource), id);
++  if (!info) {
++    wl_client_post_no_memory(client);
++    return;
++  }
++  // Describe an SDR sRGB display.
++  wp_image_description_info_v1_send_primaries_named(
++      info, WP_COLOR_MANAGER_V1_PRIMARIES_SRGB);
++  wp_image_description_info_v1_send_tf_named(
++      info, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB);
++  wp_image_description_info_v1_send_luminances(info, 2000, 80, 80);
++  wp_image_description_info_v1_send_done(info);
++  // `done` is a destructor event.
++  wl_resource_destroy(info);
++}
++
++constexpr struct wp_image_description_v1_interface kImageDescriptionImpl = {
++    .destroy = DestroyResource,
++    .get_information = ImageDescriptionGetInformation,
++};
++
++// Creates an image description resource and sends `ready`.
++void CreateImageDescription(wl_client* client,
++                            wl_resource* parent,
++                            uint32_t id,
++                            TestWpColorManager* manager,
++                            std::optional<TestImageDescriptionParams> params) {
++  wl_resource* description = CreateResourceWithImpl<TestImageDescription>(
++      client, &wp_image_description_v1_interface,
++      wl_resource_get_version(parent), &kImageDescriptionImpl, id,
++      base::DoNothing(), std::move(params));
++  if (!description) {
++    return;
++  }
++  wp_image_description_v1_send_ready(description, manager->NextIdentity());
++}
++
++// wp_image_description_creator_params_v1
++class TestImageDescriptionCreatorParams : public ServerObject {
++ public:
++  TestImageDescriptionCreatorParams(wl_resource* resource,
++                                    TestWpColorManager* manager)
++      : ServerObject(resource), manager_(manager) {}
++  ~TestImageDescriptionCreatorParams() override = default;
++
++  TestWpColorManager* manager() { return manager_; }
++  TestImageDescriptionParams& params() { return params_; }
++
++ private:
++  const raw_ptr<TestWpColorManager> manager_;
++  TestImageDescriptionParams params_;
++};
++
++TestImageDescriptionParams& GetParams(wl_resource* resource) {
++  return GetUserDataAs<TestImageDescriptionCreatorParams>(resource)->params();
++}
++
++void CreatorCreate(wl_client* client, wl_resource* resource, uint32_t id) {
++  auto* creator = GetUserDataAs<TestImageDescriptionCreatorParams>(resource);
++  TestWpColorManager* manager = creator->manager();
++  const TestImageDescriptionParams params = creator->params();
++  // Like mutter, reject a reference luminance above the max luminance (the
++  // protocol allows it with extended_target_volume, which isn't advertised).
++  if (params.luminances &&
++      params.luminances->reference > params.luminances->max) {
++    wl_resource_post_error(
++        resource,
++        WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_INVALID_LUMINANCE,
++        "reference luminance above max luminance");
++    return;
++  }
++  // Like Weston, reject max_cll or max_fall above the mastering peak.
++  if (params.mastering_luminance &&
++      ((params.max_cll && *params.max_cll > params.mastering_luminance->max) ||
++       (params.max_fall &&
++        *params.max_fall > params.mastering_luminance->max))) {
++    wl_resource_post_error(
++        resource,
++        WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_INVALID_LUMINANCE,
++        "max_cll or max_fall above mastering max luminance");
++    return;
++  }
++  manager->OnDescriptionCreated(params);
++  CreateImageDescription(client, resource, id, manager, params);
++  // `create` is a destructor request.
++  wl_resource_destroy(resource);
++}
++
++void CreatorSetTfNamed(wl_client* client, wl_resource* resource, uint32_t tf) {
++  GetParams(resource).tf_named = tf;
++}
++
++void CreatorSetTfPower(wl_client* client,
++                       wl_resource* resource,
++                       uint32_t eexp) {
++  GetParams(resource).tf_power = eexp;
++}
++
++void CreatorSetPrimariesNamed(wl_client* client,
++                              wl_resource* resource,
++                              uint32_t primaries) {
++  GetParams(resource).primaries_named = primaries;
++}
++
++void CreatorSetPrimaries(wl_client* client,
++                         wl_resource* resource,
++                         int32_t r_x,
++                         int32_t r_y,
++                         int32_t g_x,
++                         int32_t g_y,
++                         int32_t b_x,
++                         int32_t b_y,
++                         int32_t w_x,
++                         int32_t w_y) {
++  GetParams(resource).primaries =
++      std::array<int32_t, 8>{r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y};
++}
++
++void CreatorSetLuminances(wl_client* client,
++                          wl_resource* resource,
++                          uint32_t min_lum,
++                          uint32_t max_lum,
++                          uint32_t reference_lum) {
++  if (max_lum * 10000.0 <= min_lum || reference_lum * 10000.0 <= min_lum) {
++    wl_resource_post_error(
++        resource,
++        WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_INVALID_LUMINANCE,
++        "invalid luminance");
++    return;
++  }
++  GetParams(resource).luminances = TestImageDescriptionParams::Luminances{
++      .min = min_lum, .max = max_lum, .reference = reference_lum};
++}
++
++void CreatorSetMasteringDisplayPrimaries(wl_client* client,
++                                         wl_resource* resource,
++                                         int32_t r_x,
++                                         int32_t r_y,
++                                         int32_t g_x,
++                                         int32_t g_y,
++                                         int32_t b_x,
++                                         int32_t b_y,
++                                         int32_t w_x,
++                                         int32_t w_y) {
++  GetParams(resource).mastering_display_primaries =
++      std::array<int32_t, 8>{r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y};
++}
++
++void CreatorSetMasteringLuminance(wl_client* client,
++                                  wl_resource* resource,
++                                  uint32_t min_lum,
++                                  uint32_t max_lum) {
++  if (max_lum * 10000.0 <= min_lum) {
++    wl_resource_post_error(
++        resource,
++        WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_INVALID_LUMINANCE,
++        "invalid mastering luminance");
++    return;
++  }
++  GetParams(resource).mastering_luminance =
++      TestImageDescriptionParams::MasteringLuminance{.min = min_lum,
++                                                     .max = max_lum};
++}
++
++void CreatorSetMaxCll(wl_client* client,
++                      wl_resource* resource,
++                      uint32_t max_cll) {
++  GetParams(resource).max_cll = max_cll;
++}
++
++void CreatorSetMaxFall(wl_client* client,
++                       wl_resource* resource,
++                       uint32_t max_fall) {
++  GetParams(resource).max_fall = max_fall;
++}
++
++constexpr struct wp_image_description_creator_params_v1_interface
++    kCreatorParamsImpl = {
++        .create = CreatorCreate,
++        .set_tf_named = CreatorSetTfNamed,
++        .set_tf_power = CreatorSetTfPower,
++        .set_primaries_named = CreatorSetPrimariesNamed,
++        .set_primaries = CreatorSetPrimaries,
++        .set_luminances = CreatorSetLuminances,
++        .set_mastering_display_primaries = CreatorSetMasteringDisplayPrimaries,
++        .set_mastering_luminance = CreatorSetMasteringLuminance,
++        .set_max_cll = CreatorSetMaxCll,
++        .set_max_fall = CreatorSetMaxFall,
++};
++
++// wp_color_management_output_v1
++class TestColorManagementOutput : public ServerObject {
++ public:
++  TestColorManagementOutput(wl_resource* resource, TestWpColorManager* manager)
++      : ServerObject(resource), manager_(manager) {}
++  ~TestColorManagementOutput() override = default;
++
++  TestWpColorManager* manager() { return manager_; }
++
++ private:
++  const raw_ptr<TestWpColorManager> manager_;
++};
++
++void OutputGetImageDescription(wl_client* client,
++                               wl_resource* resource,
++                               uint32_t id) {
++  CreateImageDescription(
++      client, resource, id,
++      GetUserDataAs<TestColorManagementOutput>(resource)->manager(),
++      std::nullopt);
++}
++
++constexpr struct wp_color_management_output_v1_interface kOutputImpl = {
++    .destroy = DestroyResource,
++    .get_image_description = OutputGetImageDescription,
++};
++
++// wp_color_management_surface_v1
++class TestColorManagementSurface : public ServerObject {
++ public:
++  TestColorManagementSurface(wl_resource* resource,
++                             TestWpColorManager* manager,
++                             uint32_t surface_id)
++      : ServerObject(resource), manager_(manager), surface_id_(surface_id) {}
++  ~TestColorManagementSurface() override = default;
++
++  TestWpColorManager* manager() { return manager_; }
++  uint32_t surface_id() const { return surface_id_; }
++
++ private:
++  const raw_ptr<TestWpColorManager> manager_;
++  const uint32_t surface_id_;
++};
++
++void SurfaceSetImageDescription(wl_client* client,
++                                wl_resource* resource,
++                                wl_resource* image_description,
++                                uint32_t render_intent) {
++  auto* surface = GetUserDataAs<TestColorManagementSurface>(resource);
++  auto* description = GetUserDataAs<TestImageDescription>(image_description);
++  surface->manager()->OnSurfaceImageDescriptionSet(surface->surface_id(),
++                                                   description->params());
++}
++
++void SurfaceUnsetImageDescription(wl_client* client, wl_resource* resource) {
++  auto* surface = GetUserDataAs<TestColorManagementSurface>(resource);
++  surface->manager()->OnSurfaceImageDescriptionSet(surface->surface_id(),
++                                                   std::nullopt);
++}
++
++constexpr struct wp_color_management_surface_v1_interface kSurfaceImpl = {
++    .destroy = DestroyResource,
++    .set_image_description = SurfaceSetImageDescription,
++    .unset_image_description = SurfaceUnsetImageDescription,
++};
++
++// wp_color_management_surface_feedback_v1
++void FeedbackGetPreferred(wl_client* client,
++                          wl_resource* resource,
++                          uint32_t id) {
++  CreateImageDescription(
++      client, resource, id,
++      GetUserDataAs<TestColorManagementOutput>(resource)->manager(),
++      std::nullopt);
++}
++
++constexpr struct wp_color_management_surface_feedback_v1_interface
++    kFeedbackImpl = {
++        .destroy = DestroyResource,
++        .get_preferred = FeedbackGetPreferred,
++        .get_preferred_parametric = FeedbackGetPreferred,
++};
++
++// wp_color_manager_v1
++TestWpColorManager* GetManager(wl_resource* resource) {
++  return GetUserDataAs<TestWpColorManager>(resource);
++}
++
++void ManagerGetOutput(wl_client* client,
++                      wl_resource* resource,
++                      uint32_t id,
++                      wl_resource* output) {
++  CreateResourceWithImpl<TestColorManagementOutput>(
++      client, &wp_color_management_output_v1_interface,
++      wl_resource_get_version(resource), &kOutputImpl, id, base::DoNothing(),
++      GetManager(resource));
++}
++
++void ManagerGetSurface(wl_client* client,
++                       wl_resource* resource,
++                       uint32_t id,
++                       wl_resource* surface) {
++  CreateResourceWithImpl<TestColorManagementSurface>(
++      client, &wp_color_management_surface_v1_interface,
++      wl_resource_get_version(resource), &kSurfaceImpl, id, base::DoNothing(),
++      GetManager(resource), wl_resource_get_id(surface));
++}
++
++void ManagerGetSurfaceFeedback(wl_client* client,
++                               wl_resource* resource,
++                               uint32_t id,
++                               wl_resource* surface) {
++  // The feedback object only needs access to the manager, so reuse
++  // TestColorManagementOutput as its user data.
++  CreateResourceWithImpl<TestColorManagementOutput>(
++      client, &wp_color_management_surface_feedback_v1_interface,
++      wl_resource_get_version(resource), &kFeedbackImpl, id, base::DoNothing(),
++      GetManager(resource));
++}
++
++void ManagerCreateIccCreator(wl_client* client,
++                             wl_resource* resource,
++                             uint32_t id) {
++  wl_resource_post_error(resource,
++                         WP_COLOR_MANAGER_V1_ERROR_UNSUPPORTED_FEATURE,
++                         "ICC is not supported");
++}
++
++void ManagerCreateParametricCreator(wl_client* client,
++                                    wl_resource* resource,
++                                    uint32_t id) {
++  CreateResourceWithImpl<TestImageDescriptionCreatorParams>(
++      client, &wp_image_description_creator_params_v1_interface,
++      wl_resource_get_version(resource), &kCreatorParamsImpl, id,
++      base::DoNothing(), GetManager(resource));
++}
++
++void ManagerCreateWindowsScrgb(wl_client* client,
++                               wl_resource* resource,
++                               uint32_t id) {
++  wl_resource_post_error(resource,
++                         WP_COLOR_MANAGER_V1_ERROR_UNSUPPORTED_FEATURE,
++                         "Windows scRGB is not supported");
++}
++
++void ManagerGetImageDescription(wl_client* client,
++                                wl_resource* resource,
++                                uint32_t id,
++                                wl_resource* reference) {
++  wl_resource_post_error(resource,
++                         WP_COLOR_MANAGER_V1_ERROR_UNSUPPORTED_FEATURE,
++                         "get_image_description is not supported");
++}
++
++void ManagerCreateWindowsBt2100(wl_client* client,
++                                wl_resource* resource,
++                                uint32_t id) {
++  wl_resource_post_error(resource,
++                         WP_COLOR_MANAGER_V1_ERROR_UNSUPPORTED_FEATURE,
++                         "Windows BT.2100 is not supported");
++}
++
++constexpr struct wp_color_manager_v1_interface kTestWpColorManagerImpl = {
++    .destroy = DestroyResource,
++    .get_output = ManagerGetOutput,
++    .get_surface = ManagerGetSurface,
++    .get_surface_feedback = ManagerGetSurfaceFeedback,
++    .create_icc_creator = ManagerCreateIccCreator,
++    .create_parametric_creator = ManagerCreateParametricCreator,
++    .create_windows_scrgb = ManagerCreateWindowsScrgb,
++    .get_image_description = ManagerGetImageDescription,
++    .create_windows_bt2100 = ManagerCreateWindowsBt2100,
++};
++
++}  // namespace
++
++TestImageDescriptionParams::TestImageDescriptionParams() = default;
++TestImageDescriptionParams::TestImageDescriptionParams(
++    const TestImageDescriptionParams&) = default;
++TestImageDescriptionParams& TestImageDescriptionParams::operator=(
++    const TestImageDescriptionParams&) = default;
++TestImageDescriptionParams::~TestImageDescriptionParams() = default;
++
++TestWpColorManager::TestWpColorManager()
++    : GlobalObject(&wp_color_manager_v1_interface,
++                   &kTestWpColorManagerImpl,
++                   kTestWpColorManagerVersion),
++      supported_features_({
++          WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC,
++          WP_COLOR_MANAGER_V1_FEATURE_SET_PRIMARIES,
++          WP_COLOR_MANAGER_V1_FEATURE_SET_LUMINANCES,
++          WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES,
++      }) {}
++
++TestWpColorManager::~TestWpColorManager() = default;
++
++void TestWpColorManager::OnBind() {
++  wp_color_manager_v1_send_supported_intent(
++      resource(), WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
++  for (uint32_t feature : supported_features_) {
++    wp_color_manager_v1_send_supported_feature(resource(), feature);
++  }
++  for (uint32_t tf : {WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB,
++                      WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_GAMMA22,
++                      WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_BT1886,
++                      WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ,
++                      WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG,
++                      WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_LINEAR}) {
++    wp_color_manager_v1_send_supported_tf_named(resource(), tf);
++  }
++  for (uint32_t primaries : {WP_COLOR_MANAGER_V1_PRIMARIES_SRGB,
++                             WP_COLOR_MANAGER_V1_PRIMARIES_BT2020,
++                             WP_COLOR_MANAGER_V1_PRIMARIES_DISPLAY_P3}) {
++    wp_color_manager_v1_send_supported_primaries_named(resource(), primaries);
++  }
++  wp_color_manager_v1_send_done(resource());
++}
++
++std::optional<TestImageDescriptionParams>
++TestWpColorManager::GetSurfaceImageDescription(wl_resource* surface) const {
++  auto it = surface_descriptions_.find(wl_resource_get_id(surface));
++  if (it == surface_descriptions_.end()) {
++    return std::nullopt;
++  }
++  return it->second;
++}
++
++void TestWpColorManager::OnDescriptionCreated(
++    const TestImageDescriptionParams& params) {
++  created_descriptions_.push_back(params);
++}
++
++void TestWpColorManager::OnSurfaceImageDescriptionSet(
++    uint32_t surface_id,
++    std::optional<TestImageDescriptionParams> params) {
++  surface_descriptions_[surface_id] = std::move(params);
++}
++
++}  // namespace wl
+diff --git a/ui/ozone/platform/wayland/test/test_wp_color_manager.h b/ui/ozone/platform/wayland/test/test_wp_color_manager.h
+new file mode 100644
+index 00000000000000..db16d12fcebcf7
+--- /dev/null
++++ b/ui/ozone/platform/wayland/test/test_wp_color_manager.h
+@@ -0,0 +1,97 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef UI_OZONE_PLATFORM_WAYLAND_TEST_TEST_WP_COLOR_MANAGER_H_
++#define UI_OZONE_PLATFORM_WAYLAND_TEST_TEST_WP_COLOR_MANAGER_H_
++
++#include <array>
++#include <cstdint>
++#include <map>
++#include <optional>
++#include <vector>
++
++#include "ui/ozone/platform/wayland/test/global_object.h"
++
++struct wl_resource;
++
++namespace wl {
++
++// The parameters set on a wp_image_description_creator_params_v1 object.
++struct TestImageDescriptionParams {
++  struct Luminances {
++    uint32_t min = 0;
++    uint32_t max = 0;
++    uint32_t reference = 0;
++  };
++  struct MasteringLuminance {
++    uint32_t min = 0;
++    uint32_t max = 0;
++  };
++
++  TestImageDescriptionParams();
++  TestImageDescriptionParams(const TestImageDescriptionParams&);
++  TestImageDescriptionParams& operator=(const TestImageDescriptionParams&);
++  ~TestImageDescriptionParams();
++
++  std::optional<uint32_t> tf_named;
++  std::optional<uint32_t> tf_power;
++  std::optional<uint32_t> primaries_named;
++  std::optional<std::array<int32_t, 8>> primaries;
++  std::optional<Luminances> luminances;
++  std::optional<std::array<int32_t, 8>> mastering_display_primaries;
++  std::optional<MasteringLuminance> mastering_luminance;
++  std::optional<uint32_t> max_cll;
++  std::optional<uint32_t> max_fall;
++};
++
++// Manages the wp_color_manager_v1 global. Image descriptions created from
++// parametric creators are recorded so tests can inspect what the client sent.
++// Image descriptions for outputs and surface feedback describe an SDR sRGB
++// display.
++class TestWpColorManager : public GlobalObject {
++ public:
++  TestWpColorManager();
++  TestWpColorManager(const TestWpColorManager&) = delete;
++  TestWpColorManager& operator=(const TestWpColorManager&) = delete;
++  ~TestWpColorManager() override;
++
++  // GlobalObject:
++  void OnBind() override;
++
++  // Sets the features advertised to clients on bind. Must be called before the
++  // client binds the global.
++  void set_supported_features(std::vector<uint32_t> features) {
++    supported_features_ = std::move(features);
++  }
++
++  // All image descriptions created via parametric creators, in order.
++  const std::vector<TestImageDescriptionParams>& created_descriptions() const {
++    return created_descriptions_;
++  }
++
++  // Returns the parameters of the parametric image description most recently
++  // set on `surface` (a wl_surface resource), if any.
++  std::optional<TestImageDescriptionParams> GetSurfaceImageDescription(
++      wl_resource* surface) const;
++
++  void OnDescriptionCreated(const TestImageDescriptionParams& params);
++  void OnSurfaceImageDescriptionSet(
++      uint32_t surface_id,
++      std::optional<TestImageDescriptionParams> params);
++
++  // Returns a new unique identity for an image description.
++  uint32_t NextIdentity() { return ++last_identity_; }
++
++ private:
++  uint32_t last_identity_ = 0;
++  std::vector<uint32_t> supported_features_;
++  std::vector<TestImageDescriptionParams> created_descriptions_;
++  // Keyed by wl_surface resource id.
++  std::map<uint32_t, std::optional<TestImageDescriptionParams>>
++      surface_descriptions_;
++};
++
++}  // namespace wl
++
++#endif  // UI_OZONE_PLATFORM_WAYLAND_TEST_TEST_WP_COLOR_MANAGER_H_

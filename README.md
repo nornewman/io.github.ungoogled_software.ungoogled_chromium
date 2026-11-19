@@ -1,3 +1,11 @@
+> **Fork, branch `hdr-max-cll-157`:** Ungoogled Chromium 157 with Chromium's fix for HDR highlights clipped at SDR
+> white on KDE Plasma 6.8 backported (upstream commit
+> [d66f5d19bb](https://github.com/chromium/chromium/commit/d66f5d19bb37835300a9cb699a8b4ca0137951f0),
+> "[Wayland] Describe the primary plane's real HDR peak to the compositor", in Chromium 159;
+> [crbug 486197634](https://issues.chromium.org/issues/486197634)). The patch is
+> `patches/chromium-local/wayland-describe-primary-plane-hdr-peak.patch`, unchanged from upstream. Not needed
+> once Ungoogled Chromium 159 is on Flathub.
+
 # ungoogled-chromium flatpak
 
 Please direct bug reports to the [official repository](
