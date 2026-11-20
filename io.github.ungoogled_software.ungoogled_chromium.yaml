@@ -325,3 +325,19 @@ modules:
         path: build-aux
       - type: dir
         path: branding/to_copy
+      # hdr-max-cll-157-arm64: cross build on an x86_64 host under qemu-user. The x86_64 LLVM of the same revision
+      # replaces the aarch64 binaries and runs natively (build-aux/x86-toolchain.py); a native build skips it.
+      - type: archive
+        url: *llvm_prebuilt_x64_url
+        sha256: *llvm_prebuilt_x64_sha256
+        dest: _build_tools/llvm-x64
+        strip-components: 0
+        only-arches: [aarch64]
+      - type: dir
+        path: x86libs
+        dest: _build_tools/x86libs
+        only-arches: [aarch64]
+      - type: shell
+        commands:
+          - python3 x86-toolchain.py
+        only-arches: [aarch64]

@@ -53,10 +53,20 @@ if [[ "$(uname -m)" == "aarch64" ]]; then
   arch_args='use_v4l2_codec=true use_vaapi=false use_av1_hw_decoder=true'
 fi
 
+# hdr-max-cll-157-arm64: aarch64 cross build on an x86_64 host (x86-toolchain.py staged the x86_64 LLVM). sccache
+# would run under qemu and hash every preprocessed file there, so it's off; GN itself is built with the native clang.
+cc_wrapper_arg='cc_wrapper="/app/bin/sccache"'
+if [[ -e _build_tools/x86libs/ld-linux-x86-64.so.2 ]]; then
+  cc_wrapper_arg=
+  export CC=$PWD/third_party/llvm-build/Release+Asserts/bin/clang
+  export CXX=$PWD/third_party/llvm-build/Release+Asserts/bin/clang++
+  export AR=$PWD/third_party/llvm-build/Release+Asserts/bin/llvm-ar
+fi
+
 # ungoogled-chromium's own GN flags come first; cc_wrapper enables sccache.
 tools/gn/bootstrap/bootstrap.py -v --no-clean --gn-gen-args="
     $(cat uc/flags.gn)
-    cc_wrapper=\"/app/bin/sccache\"
+    $cc_wrapper_arg
     use_sysroot=false
     symbol_level=0
     is_official_build=true

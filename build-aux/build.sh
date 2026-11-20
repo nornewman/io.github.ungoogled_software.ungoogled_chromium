@@ -14,10 +14,12 @@ ln_overwrite_all /usr/lib/sdk/openjdk21 third_party/jdk/current
 
 # GN invokes rustc directly rather than through Cargo, so this wrapper adapts
 # Chromium's Rust output paths and sysroots for sccache.
-export RUSTC_WRAPPER=$PWD/rustc-cache.py
+# (Not for the aarch64 cross build: the wrapper and sccache would run under qemu.)
+cross=; [[ -e _build_tools/x86libs/ld-linux-x86-64.so.2 ]] && cross=1
+[[ -n $cross ]] || export RUSTC_WRAPPER=$PWD/rustc-cache.py
 
 # hdr-max-cll-157: compile the code the HDR backport touches first, so a backport
 # error shows up in minutes instead of after the whole browser build.
 ninja -C out/Release -j$FLATPAK_BUILDER_N_JOBS components/viz/service:service ui/ozone/platform/wayland:wayland
 ninja -C out/Release -j$FLATPAK_BUILDER_N_JOBS chrome chrome_crashpad_handler
-/app/bin/sccache --show-stats
+[[ -n $cross ]] || /app/bin/sccache --show-stats

@@ -1,0 +1,3 @@
+Filled only for the cross build on an x86_64 host (homelab configs/nor-pc/ungoogled-chromium-hdr/build-arm64.sh
+copies ld-linux-x86-64.so.2, libc, libm, libpthread, librt, libdl, libz and libgcc_s here from the x86_64
+org.freedesktop.Sdk). Empty means a native build; build-aux/x86-toolchain.py then does nothing.
