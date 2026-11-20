@@ -211,6 +211,10 @@ modules:
         SCCACHE_DIR: /run/ccache/sccache
         # Object and preprocessor caches each get 7 GiB, below Flathub's 18 GiB cap.
         SCCACHE_CACHE_SIZE: 7G
+        # hdr-max-cll-157: Blink's and Mojo's Python generators start a worker per CPU each. With 24-32 ninja jobs
+        # on a 32-thread machine that was ~400 python3 processes and ~40 GB (nor-pc, 20 Nov), so cap them.
+        # Python 3.13+ (the 26.08 SDK has 3.14) reads this for os.cpu_count() and multiprocessing.
+        PYTHON_CPU_COUNT: '4'
     build-commands:
       - ./bootstrap.sh
       - ./build.sh
