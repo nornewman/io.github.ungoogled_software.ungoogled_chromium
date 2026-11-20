@@ -10,7 +10,7 @@ build of the same LLVM revision (Chromium ships both from one commit):
 - _build_tools/x86libs   the few x86_64 glibc/zlib/libgcc_s libraries those binaries need, copied from the host's
                          x86_64 org.freedesktop.Sdk before the build
 
-Each x86_64 binary gets its PT_INTERP rewritten to <builddir>/x/ld.so (same length or shorter than
+Each x86_64 binary gets its PT_INTERP rewritten to /run/build/chromium/x/ld.so (same length or shorter than
 /lib64/ld-linux-x86-64.so.2) and finds the other libraries through its RUNPATH ($ORIGIN/../lib). clang.cfg and
 clang++.cfg make aarch64-unknown-linux-gnu the default target, for callers that don't pass --target (rustc's
 linker calls, GN's host toolchain, which is also arm64 here).
@@ -28,7 +28,9 @@ LLVM = os.path.join(ROOT, "_build_tools/llvm")
 LLVM_X64 = os.path.join(ROOT, "_build_tools/llvm-x64")
 X86LIBS = os.path.join(ROOT, "_build_tools/x86libs")
 INTERP_DIR = os.path.join(ROOT, "x")
-INTERP = os.path.join(INTERP_DIR, "ld.so")
+# Absolute path as the build commands see it: flatpak-builder bind-mounts the module's build dir at
+# /run/build/<module> for build-commands, while source steps like this one run at its host path.
+INTERP = os.environ.get("X86_TOOLCHAIN_INTERP", "/run/build/chromium/x/ld.so")
 TARGET = "aarch64-unknown-linux-gnu"
 
 
@@ -69,7 +71,7 @@ def main():
         sys.exit(f"x86-toolchain: libc.so.6 missing in {X86LIBS}")
 
     os.makedirs(INTERP_DIR, exist_ok=True)
-    shutil.copy2(os.path.join(X86LIBS, "ld-linux-x86-64.so.2"), INTERP)
+    shutil.copy2(os.path.join(X86LIBS, "ld-linux-x86-64.so.2"), os.path.join(INTERP_DIR, "ld.so"))
     lib = os.path.join(LLVM, "lib")
     for name in os.listdir(X86LIBS):
         if name != "ld-linux-x86-64.so.2":
